@@ -1,0 +1,167 @@
+---
+title: "Practical Machine Learning Course Project"
+output:
+  html_document:
+    toc: true
+    theme: united
+---
+
+## Data pre-processing and gross model design
+
+The first thing one notices about the data is that a lot of the columns contain summary statistics about certain windows of data. These are not very useful, since most algorithms we could use would not be able to make use of them. Notably, the testing data set does not even contain values in those columns. Other columns that we want to exclude are the running index (column `X`) and the time-stamps. The time-stamps are somewhat interesting in this case, since the testing data set comes from the same source as the training data set, so its very easy to build a classifier that merely looks at the time-stamps... this seems to go against the spirit of this assignment so I did not do that.
+
+To that end, I loaded the data and removed the useless columns.
+
+```{r, message=FALSE}
+library(caret)
+
+raw_data <- read.csv("pml-training.csv")
+raw_final_testing <- read.csv("pml-testing.csv")
+
+bad_cols <- c(
+  "X", "raw_timestamp_part_1", "raw_timestamp_part_2", "cvtd_timestamp", 
+	"new_window", "num_window", "kurtosis_roll_belt", "kurtosis_picth_belt", 
+	"kurtosis_yaw_belt", "skewness_roll_belt", "skewness_roll_belt.1", 
+	"skewness_yaw_belt", "max_roll_belt", "max_picth_belt", "max_yaw_belt", 
+	"min_roll_belt", "min_pitch_belt", "min_yaw_belt", "amplitude_roll_belt", 
+	"amplitude_pitch_belt", "amplitude_yaw_belt", "var_total_accel_belt", 
+	"avg_roll_belt", "stddev_roll_belt", "var_roll_belt", "avg_pitch_belt", 
+	"stddev_pitch_belt", "var_pitch_belt", "avg_yaw_belt", "stddev_yaw_belt", 
+	"var_yaw_belt", "var_accel_arm", "avg_roll_arm", "stddev_roll_arm", 
+	"var_roll_arm", "avg_pitch_arm", "stddev_pitch_arm", "var_pitch_arm", 
+	"avg_yaw_arm", "stddev_yaw_arm", "var_yaw_arm", "kurtosis_roll_arm", 
+	"kurtosis_picth_arm", "kurtosis_yaw_arm", "skewness_roll_arm", 
+	"skewness_pitch_arm", "skewness_yaw_arm", "max_roll_arm", "max_picth_arm", 
+	"max_yaw_arm", "min_roll_arm", "min_pitch_arm", "min_yaw_arm", 
+	"amplitude_roll_arm", "amplitude_pitch_arm", "amplitude_yaw_arm", 
+	"kurtosis_roll_dumbbell", "kurtosis_picth_dumbbell", "kurtosis_yaw_dumbbell", 
+	"skewness_roll_dumbbell", "skewness_pitch_dumbbell", "skewness_yaw_dumbbell", 
+	"max_roll_dumbbell", "max_picth_dumbbell", "max_yaw_dumbbell", 
+	"min_roll_dumbbell", "min_pitch_dumbbell", "min_yaw_dumbbell", 
+	"amplitude_roll_dumbbell", "amplitude_pitch_dumbbell", 
+	"amplitude_yaw_dumbbell", "total_accel_dumbbell", "var_accel_dumbbell", 
+	"avg_roll_dumbbell", "stddev_roll_dumbbell", "var_roll_dumbbell", 
+	"avg_pitch_dumbbell", "stddev_pitch_dumbbell", "var_pitch_dumbbell", 
+	"avg_yaw_dumbbell", "stddev_yaw_dumbbell", "var_yaw_dumbbell", 
+	"kurtosis_roll_forearm", "kurtosis_picth_forearm", "kurtosis_yaw_forearm", 
+	"skewness_roll_forearm", "skewness_pitch_forearm", "skewness_yaw_forearm", 
+	"max_roll_forearm", "max_picth_forearm", "max_yaw_forearm", "min_roll_forearm", 
+	"min_pitch_forearm", "min_yaw_forearm", "amplitude_roll_forearm", 
+	"amplitude_pitch_forearm", "amplitude_yaw_forearm", "var_accel_forearm", 
+	"avg_roll_forearm", "stddev_roll_forearm", "var_roll_forearm", 
+	"avg_pitch_forearm", "stddev_pitch_forearm", "var_pitch_forearm", 
+	"avg_yaw_forearm", "stddev_yaw_forearm", "var_yaw_forearm"
+)
+
+# Processed data
+proc_data <- raw_data[, !(names(raw_data) %in% bad_cols)]
+proc_final_testing <- raw_final_testing[, !(names(raw_final_testing) %in% bad_cols)]
+```
+
+Now, I looked at the data itself. Consider the two variables `roll_belt` and `pitch_belt`. We can make a scatter plot of the two, coloring them by the class:
+
+```{r}
+qplot(roll_belt, pitch_belt, data = proc_data, color=proc_data$classe)
+```
+
+That seems very complicated, there are multiple clusters for each class which will make classification complicated. In a practical setting, however, the model will most likely be trained only for a single user, so considering the data as a whole may be inappropriate. Let us, then, extract the data for just a single user (e.g. `charles`) and repeat the same plot:
+
+```{r}
+charles_data <- proc_data[proc_data$user_name == 'charles', ]
+qplot(roll_belt, pitch_belt, data = charles_data, color=charles_data$classe)
+```
+
+This looks a lot simpler, each class appears to have a single cluster and the remaining variables may be useful in disambiguating the overlapping data points.
+
+Thus, I treated this problem as a six separate classification problems, one for each user. I trained each model on the data belonging to one of the users, and computed predictions, accuracy etc from that model. While in principle a model could generalize across users and gain additional performance, by doing this simple pre-processing step I enable the use of simpler models. In particular, some users appear to have failed sensors so those columns were removed before training.
+
+## Model training and cross-validation
+
+I used a function to perform model training. First, I split the data for each user into 3 chunks. Since there is a lot of data, I used approximately 80% for training the model, 10% for cross-validating the model and 10% to estimate the out-of-sample classification error. While developing this model, I tried several different training methods and I used the validation error to choose the one that seemed to work reasonably well. I also tried some pre-processing with `pca`, but found it to actually decrease performance. I ended up settling on quadratic discriminant analysis because it ran quickly and produced reasonable results. After I trained and tested every model, I looked at the testing error and reported it here (see later).
+
+The function to train and test the model is as follows:
+
+```{r}
+user_model <- function(proc_data, user_name, method = 'qda')
+{
+  # Extract the data associated with the user, remove the user column
+  user_data <- proc_data[proc_data$user_name == user_name, !(names(proc_data) %in% 'user_name')]
+  
+  # Find columns with zero variance
+  zero_var_columns <- nearZeroVar(user_data, saveMetrics=T)$zeroVar
+
+  # Remove the zero-variance columns
+  user_data <- user_data[, !zero_var_columns]
+
+  # Partition the data between training and testing data
+  in_train <- createDataPartition(user_data$classe, p = 0.9, list = F)
+
+  training <- user_data[in_train,]
+  testing <- user_data[-in_train,]
+
+  # Partition the training data into training and validation
+  in_valid <- createDataPartition(training$classe, p = 0.1, list = F)
+
+  validation <- training[in_valid,]
+  training <- training[-in_valid,]
+  
+  model <- train(classe ~ ., data = training, method = method)
+  
+  # Compute the predictions for the validation and testing data sets
+  preds <- predict(model, validation[, !(names(validation) %in% 'classe')])
+  conf <- confusionMatrix(preds, validation$classe)
+  
+  preds <- predict(model, testing[, !(names(testing) %in% 'classe')])
+  test_conf <- confusionMatrix(preds, testing$classe)
+  
+  return(list(model = model, conf = conf, test_conf = test_conf, zero_var_columns = zero_var_columns))
+}
+```
+
+Now, to actually train the models I used a loop. To compute the validation and testing errors I did a weighted average of the accuracies of individual models (because different users had different numbers of data points):
+
+```{r, message=FALSE}
+set.seed(1)
+
+user_names <- levels(proc_data$user_name)
+results <- list()
+validation_accuracy <- c()
+test_accuracy <- c()
+
+for (user_name in user_names)
+{
+  num_datapoints <- sum(proc_data$user_name == user_name)
+	
+  res <- user_model(proc_data, user_name)
+  results[[user_name]] <- res
+  validation_accuracy <- append(validation_accuracy, res$conf$overall[[1]] * num_datapoints)
+  test_accuracy <- append(test_accuracy, res$test_conf$overall[[1]] * num_datapoints)
+}
+
+# Compute the weighted average
+validation_accuracy <- sum(validation_accuracy / dim(proc_data)[[1]])
+test_accuracy <- sum(test_accuracy / dim(proc_data)[[1]])
+```
+
+The resultant accuracies were:
+```{r}
+validation_accuracy
+test_accuracy
+```
+Those seemed reasonable to me. The test accuracy is what I claim my out-of-sample error will be, as I did not use this value to influence my model choices, or model parameters in any way. I could get higher validation accuracy with a random forest, but that takes forever to run.
+
+Then I just ran the models on the testing data set to produce the submission files.
+
+```{r}
+for (i in 1:dim(proc_final_testing)[1])
+{
+  filename <- paste0("problem_id_", i, ".txt")
+	user_name <- proc_final_testing[[i, "user_name"]]
+	res <- results[[user_name]]
+	
+	user_data <- proc_final_testing[i, !(names(proc_final_testing) %in% 'user_name')]
+	user_data <- user_data[, !res$zero_var_columns]
+	pred <- predict(res$model, user_data[, !(names(user_data) %in% 'problem_id')])
+	write(as.character(pred), file = filename)
+}
+```
